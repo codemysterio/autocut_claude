@@ -80,6 +80,24 @@ def save(p: dict) -> None:
         os.replace(tmp, f)
 
 
+def duplicate(pid: str, keep_cuts: bool = False) -> dict:
+    """Copy a media project (transcript, preview, waveform) as a new project, by default without its cuts."""
+    src = get(pid)
+    new = json.loads(json.dumps(src))
+    new.update(id=new_id(), created=time.time(), version=0, owns_media=False,
+               cuts=new["cuts"] if keep_cuts else [],
+               export={"state": "idle", "progress": 0.0, "file": None, "message": ""})
+    d_src, d_new = project_dir(pid), project_dir(new["id"])
+    d_new.mkdir(parents=True, exist_ok=True)
+    for name in ("audio16k.wav", "proxy.mp4", "proxy.m4a", "peaks.json", "sprite.jpg"):
+        if (d_src / name).exists():
+            shutil.copy2(d_src / name, d_new / name)
+    with _lock:
+        _cache[new["id"]] = new
+        save(new)
+    return new
+
+
 def list_all() -> list[dict]:
     out = []
     for d in sorted(PROJECTS_DIR.iterdir() if PROJECTS_DIR.exists() else [], key=lambda x: x.stat().st_mtime, reverse=True):

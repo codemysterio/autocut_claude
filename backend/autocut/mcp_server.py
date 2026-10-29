@@ -100,7 +100,7 @@ def open_media(path: str, language: str = "auto", model: str = "") -> str:
         st = _call("GET", f"/projects/{pid}")["status"]
         if st["state"] != "processing":
             break
-    return f"project_id={pid}\n" + project_status(pid) + f"\nBrowser UI: {BASE}/#/p/{pid}"
+    return f"project_id={pid}\n" + project_status(pid) + f"\nBrowser UI: {BASE}/#/p/{pid} (opens it on a timeline)"
 
 
 @mcp.tool()
@@ -345,6 +345,101 @@ def export_status(project_id: str, wait: int = 0) -> str:
     if e["state"] == "error":
         return f"Render failed: {e['message']}"
     return f"{e['state']} {int(e['progress'] * 100)}%"
+
+
+# ------------------------------------------------------------------ sequences (timeline)
+
+def _seq_text(s: dict) -> str:
+    st = s["settings"]
+    head = (f"sequence_id={s['id']} \"{s['name']}\" {_t(s['duration'])}, "
+            + (f"{st['width']}x{st['height']} {st['fps_num'] / st['fps_den']:.2f} fps" if st["has_video"] else "audio only"))
+    clips = [f"  {i}. clip_id={c['id']} {c['name']} ({c['kind']}) at {_t(c['start'])}, length {_t(c['length'])}"
+             for i, c in enumerate(s["clips"])]
+    bin_only = [i["name"] + f" (project_id={i['id']}, {i['state']})" for i in s["items"]
+                if not any(c["pid"] == i["id"] for c in s["clips"])]
+    return "\n".join([head, *clips] + ([f"In bin, not on timeline: {', '.join(bin_only)}"] if bin_only else [])
+                     + [f"Browser UI: {BASE}/#/s/{s['id']}"])
+
+
+@mcp.tool()
+def create_sequence(name: str = "") -> str:
+    """Create an empty timeline (sequence). Import media into it, then arrange the clips in order."""
+    return _seq_text(_call("POST", "/sequences", json={"name": name}))
+
+
+@mcp.tool()
+def list_sequences() -> str:
+    """List timelines."""
+    ss = _call("GET", "/sequences")
+    return "\n".join(f"{s['id']}  {s['name']}  {s['clips']} clips, {_t(s['duration'])}" for s in ss) or "No sequences yet."
+
+
+@mcp.tool()
+def sequence_status(sequence_id: str) -> str:
+    """Show the clip order, positions and lengths of a timeline (cuts already applied)."""
+    return _seq_text(_call("GET", f"/sequences/{sequence_id}"))
+
+
+@mcp.tool()
+def import_to_sequence(sequence_id: str, paths: list[str], language: str = "auto", model: str = "") -> str:
+    """Import video/audio files (absolute paths) into a timeline; they are appended in the order given.
+
+    Each file is transcribed in the background (watch project_status / sequence_status).
+    """
+    return _seq_text(_call("POST", f"/sequences/{sequence_id}/import-path", json={
+        "paths": paths, "language": language, "model": model or None, "add_to_timeline": True}))
+
+
+@mcp.tool()
+def add_clip(sequence_id: str, project_id: str, position: int = -1) -> str:
+    """Place media (a project_id) on the timeline at a 0-based position; -1 appends at the end."""
+    r = _call("POST", f"/sequences/{sequence_id}/clips", json={"project_id": project_id,
+                                                               "index": None if position < 0 else position})
+    return _seq_text(r["sequence"])
+
+
+@mcp.tool()
+def move_clip(sequence_id: str, clip_id: str, position: int) -> str:
+    """Move a timeline clip to a new 0-based position in the order."""
+    return _seq_text(_call("POST", f"/sequences/{sequence_id}/clips/{clip_id}/move", json={"index": position}))
+
+
+@mcp.tool()
+def remove_clip(sequence_id: str, clip_id: str) -> str:
+    """Remove a clip from the timeline (the media and its transcript are kept)."""
+    return _seq_text(_call("DELETE", f"/sequences/{sequence_id}/clips/{clip_id}"))
+
+
+@mcp.tool()
+def export_sequence(sequence_id: str, kind: str = "xml", output_folder: str = "") -> str:
+    """Export the whole timeline: kind = xml (Premiere Pro), edl, srt, vtt or txt."""
+    r = _call("POST", f"/sequences/{sequence_id}/export", json={"kind": kind, "out_dir": output_folder or None})
+    return "Saved " + r["file"]
+
+
+@mcp.tool()
+def render_sequence(sequence_id: str, format: str = "", output_folder: str = "") -> str:
+    """Render the whole timeline to one video/audio file with ffmpeg (waits up to ~40s, then poll)."""
+    _call("POST", f"/sequences/{sequence_id}/export",
+          json={"kind": "media", "format": format or None, "out_dir": output_folder or None})
+    for _ in range(40):
+        e = _call("GET", f"/sequences/{sequence_id}/export-status")
+        if e["state"] != "running":
+            break
+        time.sleep(1)
+    if e["state"] == "done":
+        return f"Rendered: {e['file']}"
+    if e["state"] == "error":
+        return f"Render failed: {e['message']}"
+    return f"still rendering ({int(e['progress'] * 100)}%); call render_sequence_status"
+
+
+@mcp.tool()
+def render_sequence_status(sequence_id: str) -> str:
+    """Progress of a render_sequence job."""
+    e = _call("GET", f"/sequences/{sequence_id}/export-status")
+    return f"Rendered: {e['file']}" if e["state"] == "done" else (
+        f"Render failed: {e['message']}" if e["state"] == "error" else f"{e['state']} {int(e['progress'] * 100)}%")
 
 
 def main() -> None:

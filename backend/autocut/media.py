@@ -66,19 +66,57 @@ def extract_wav(src: str, dst: Path) -> None:
         raise RuntimeError(f"Audio extraction failed: {r.stderr.strip()[:400]}")
 
 
-def make_proxy(src: str, dst: Path, has_video: bool) -> bool:
-    """Make a browser-playable copy (H.264/AAC) with the same timeline as the source."""
+SPRITE_W, SPRITE_H = 160, 90
+
+
+def sprite_count(duration: float) -> int:
+    return int(min(60, max(2, -(-duration // 2))))
+
+
+def make_sprite(src: str, dst: Path, duration: float) -> bool:
+    """One JPEG strip of evenly spaced thumbnails (count x 1 tiles) for the timeline filmstrip."""
+    count = sprite_count(duration)
+    vf = (f"fps={count}/{max(duration, 0.1):.3f},scale={SPRITE_W}:{SPRITE_H}:force_original_aspect_ratio=decrease,"
+          f"pad={SPRITE_W}:{SPRITE_H}:(ow-iw)/2:(oh-ih)/2,tile={count}x1")
+    # Long files: decode keyframes only, thumbnails do not need to be exact.
+    pre = ["-skip_frame", "nokey"] if duration > 120 else []
+    r = run(["ffmpeg", "-y", "-v", "error", *pre, "-i", src, "-vf", vf, "-frames:v", "1", "-q:v", "5", str(dst)])
+    return r.returncode == 0 and dst.exists()
+
+
+def _run_with_progress(cmd: list[str], duration: float, progress) -> bool:
+    """Run ffmpeg with -progress output; report the finished fraction through `progress`."""
+    proc = subprocess.Popen(cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, creationflags=_NO_WINDOW)
+    for line in proc.stdout:  # type: ignore[union-attr]
+        if progress and duration and line.startswith("out_time_us="):
+            try:
+                progress(min(0.99, int(line.split("=")[1]) / 1e6 / duration))
+            except ValueError:
+                pass
+    return proc.wait() == 0
+
+
+def make_proxy(src: str, dst: Path, has_video: bool, duration: float = 0.0, progress=None) -> bool:
+    """Make a browser-playable copy (H.264/AAC) with the same timeline as the source.
+
+    Tries the fully GPU path first (NVDEC decode + NVENC encode), which is several times faster
+    than CPU decoding for 4K / HEVC footage, then falls back to slower but more compatible paths.
+    """
     if not has_video:
         cmds = [["ffmpeg", "-y", "-v", "error", "-i", src, "-vn", "-c:a", "aac", "-b:a", "128k", str(dst)]]
     else:
-        vf = "scale=-2:'min(720,ih)'"
-        base = ["ffmpeg", "-y", "-v", "error", "-i", src, "-vf", vf]
         tail = ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)]
+        cpu_in = ["ffmpeg", "-y", "-v", "error", "-i", src, "-vf", "scale=-2:'min(720,ih)'"]
         cmds = [
-            base + ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "30", "-pix_fmt", "yuv420p"] + tail,
-            base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "27", "-pix_fmt", "yuv420p"] + tail,
+            ["ffmpeg", "-y", "-v", "error", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", src,
+             "-vf", "scale_cuda=-2:720:format=nv12", "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "30"] + tail,
+            cpu_in + ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "30", "-pix_fmt", "yuv420p"] + tail,
+            cpu_in + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "27", "-pix_fmt", "yuv420p"] + tail,
         ]
     for cmd in cmds:
-        if run(cmd).returncode == 0 and dst.exists():
+        dst.unlink(missing_ok=True)
+        if _run_with_progress(cmd, duration, progress) and dst.exists():
             return True
+    dst.unlink(missing_ok=True)
     return False

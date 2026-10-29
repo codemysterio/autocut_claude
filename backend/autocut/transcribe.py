@@ -134,8 +134,7 @@ def process(pid: str, language: str, model_name: str) -> None:
         wav = d / "audio16k.wav"
         media.extract_wav(p["media"]["path"], wav)
 
-        if not p["proxy"] and not (d / "proxy.mp4").exists() and not (d / "proxy.m4a").exists():
-            threading.Thread(target=_build_proxy, args=(pid,), daemon=True).start()
+        ensure_proxy(pid)
 
         _set(p, step=f"Transcribing ({model_name})", progress=0.0)
         p["model"] = model_name
@@ -153,13 +152,37 @@ def process(pid: str, language: str, model_name: str) -> None:
         _set(p, state="error", step="", message=str(e)[:500])
 
 
+_proxy_building: set[str] = set()
+
+
+def ensure_proxy(pid: str) -> None:
+    """Build the preview copy in the background if it is missing (also recovers after a restart)."""
+    p = store.get(pid)
+    if p["proxy"] or pid in _proxy_building:
+        return
+    _proxy_building.add(pid)
+    threading.Thread(target=_build_proxy, args=(pid,), daemon=True).start()
+
+
 def _build_proxy(pid: str) -> None:
     p = store.get(pid)
-    d = store.project_dir(pid)
-    dst = d / ("proxy.mp4" if p["media"]["has_video"] else "proxy.m4a")
-    ok = media.make_proxy(p["media"]["path"], dst, p["media"]["has_video"])
-    p["proxy"] = bool(ok)
-    store.save(p)
+    dst = store.project_dir(pid) / ("proxy.mp4" if p["media"]["has_video"] else "proxy.m4a")
+    last = [0.0]
+
+    def progress(f: float) -> None:
+        if time.time() - last[0] > 1.5:
+            last[0] = time.time()
+            p["proxy_progress"] = round(f, 3)
+            store.save(p)
+
+    try:
+        p["proxy_progress"] = 0.0
+        ok = media.make_proxy(p["media"]["path"], dst, p["media"]["has_video"], p["media"]["duration"], progress)
+        p["proxy"] = bool(ok)
+        p["proxy_progress"] = 1.0 if ok else 0.0
+        store.save(p)
+    finally:
+        _proxy_building.discard(pid)
 
 
 def submit(pid: str, language: str = "auto", model_name: str | None = None) -> None:

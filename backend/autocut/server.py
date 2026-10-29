@@ -1,15 +1,17 @@
 """AutoCut web server: REST API + static frontend."""
 import json
 import shutil
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import cleanup, editing, exporters, media, store, transcribe
+from . import cleanup, editing, exporters, media, sequences, store, transcribe
 from .config import DATA_DIR, DEFAULT_MODEL, FRONTEND_DIR, PORT
 
 app = FastAPI(title="AutoCut")
@@ -91,30 +93,37 @@ def _create_from_file(path: Path, name: str, owns: bool, language: str, model: s
     return payload(p)
 
 
-@app.post("/api/projects")
-async def upload_project(file: UploadFile = File(...), language: str = Form("auto"), model: str = Form("")):
-    pid_hint = store.new_id()
-    tmp_dir = DATA_DIR / "uploads" / pid_hint
+def _register_upload(dest: Path, tmp_dir: Path, name: str, language: str, model: str | None) -> dict:
+    try:
+        info = media.probe(dest)
+    except ValueError as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(400, f"{name}: {e}")
+    p = store.create(dest.stem, info, True)
+    media_dir = store.project_dir(p["id"]) / "media"
+    media_dir.mkdir(exist_ok=True)
+    final = media_dir / dest.name
+    shutil.move(str(dest), final)  # same drive: a rename, not a copy
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    p["media"]["path"] = str(final.resolve())
+    store.save(p)
+    transcribe.submit(p["id"], language, model)
+    return p
+
+
+async def _ingest_upload(file: UploadFile, language: str, model: str | None) -> dict:
+    tmp_dir = DATA_DIR / "uploads" / store.new_id()
     tmp_dir.mkdir(parents=True, exist_ok=True)
     dest = tmp_dir / Path(file.filename or "upload").name
     with dest.open("wb") as f:
         while chunk := await file.read(1024 * 1024):
             f.write(chunk)
-    try:
-        info = media.probe(dest)
-    except ValueError as e:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(400, str(e))
-    p = store.create(dest.stem, info, True)
-    media_dir = store.project_dir(p["id"]) / "media"
-    media_dir.mkdir(exist_ok=True)
-    final = media_dir / dest.name
-    shutil.move(str(dest), final)
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    p["media"]["path"] = str(final.resolve())
-    store.save(p)
-    transcribe.submit(p["id"], language, model or None)
-    return payload(p)
+    return _register_upload(dest, tmp_dir, file.filename or "upload", language, model)
+
+
+@app.post("/api/projects")
+async def upload_project(file: UploadFile = File(...), language: str = Form("auto"), model: str = Form("")):
+    return payload(await _ingest_upload(file, language, model or None))
 
 
 @app.post("/api/projects/from-path")
@@ -140,7 +149,19 @@ def get_version(pid: str):
 def delete_project(pid: str):
     proj(pid)
     store.delete(pid)
+    sequences.remove_project(pid)
     return {"ok": True}
+
+
+class DuplicateReq(BaseModel):
+    keep_cuts: bool = False
+
+
+@app.post("/api/projects/{pid}/duplicate")
+def duplicate_project(pid: str, body: DuplicateReq):
+    """A fresh copy of this media's transcript (without cuts unless asked), e.g. to start over."""
+    proj(pid)
+    return payload(store.duplicate(pid, body.keep_cuts))
 
 
 class TranscribeReq(BaseModel):
@@ -161,6 +182,8 @@ def retranscribe(pid: str, body: TranscribeReq):
 def get_media(pid: str):
     p = proj(pid)
     d = store.project_dir(pid)
+    if not p["proxy"]:
+        transcribe.ensure_proxy(pid)
     for name in ("proxy.mp4", "proxy.m4a"):
         f = d / name
         if p["proxy"] and f.exists():
@@ -411,6 +434,353 @@ def download(pid: str, kind: str):
     need_transcript(p)
     try:
         path = exporters.write_text_export(p, kind)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return FileResponse(path, filename=path.name)
+
+
+# ------------------------------------------------------------------ native file picker
+
+_PICKER = r"""
+import json, tkinter as tk
+from tkinter import filedialog
+root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+exts = " ".join("*" + e for e in sorted(%s))
+paths = filedialog.askopenfilenames(parent=root, title="Choose video or audio files",
+                                    filetypes=[("Video and audio", exts), ("All files", "*.*")])
+print(json.dumps(list(paths)))
+"""
+
+
+@app.post("/api/pick-files")
+def pick_files():
+    """Open the Windows file dialog on this PC and return the chosen paths, so nothing has to be uploaded."""
+    code = _PICKER % repr(sorted(media.VIDEO_EXT | media.AUDIO_EXT))
+    try:
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600,
+                           creationflags=media._NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(408, "No file was chosen")
+    if r.returncode != 0:
+        raise HTTPException(500, "Could not open the file dialog: " + r.stderr.strip()[-200:])
+    return {"paths": json.loads(r.stdout.strip().splitlines()[-1])}
+
+
+# ------------------------------------------------------------------ timeline media: waveform + filmstrip
+
+PEAKS_PER_SEC = 100
+_prep_lock = threading.Lock()
+
+
+@app.get("/api/projects/{pid}/peaks")
+def get_peaks(pid: str):
+    """Waveform data: 100 peak values (0-255) per second of audio."""
+    p = proj(pid)
+    f = store.project_dir(pid) / "peaks.json"
+    if not f.exists():
+        if not p["media"]["has_audio"]:
+            return {"rate": PEAKS_PER_SEC, "peaks": []}
+        import numpy as np
+
+        with _prep_lock:
+            if not f.exists():
+                r = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-i", p["media"]["path"], "-vn", "-ac", "1", "-ar", "8000",
+                     "-f", "s16le", "-"], capture_output=True, creationflags=media._NO_WINDOW)
+                if r.returncode != 0:
+                    raise HTTPException(500, "Could not read audio for the waveform")
+                a = np.abs(np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32)) / 32768.0
+                step = 8000 // PEAKS_PER_SEC
+                n = len(a) // step
+                peaks = a[:n * step].reshape(n, step).max(axis=1) if n else np.zeros(0)
+                data = np.minimum(255, (peaks ** 0.6 * 255)).astype(int).tolist()
+                f.write_text(json.dumps({"rate": PEAKS_PER_SEC, "peaks": data}), encoding="utf-8")
+    return FileResponse(f, media_type="application/json")
+
+
+@app.get("/api/projects/{pid}/sprite.jpg")
+def get_sprite(pid: str):
+    p = proj(pid)
+    if not p["media"]["has_video"]:
+        raise HTTPException(404, "Audio file has no picture")
+    d = store.project_dir(pid)
+    f = d / "sprite.jpg"
+    if not f.exists():
+        with _prep_lock:
+            if not f.exists():
+                proxy = d / "proxy.mp4"
+                src = str(proxy) if p["proxy"] and proxy.exists() else p["media"]["path"]
+                if not media.make_sprite(src, f, p["media"]["duration"]):
+                    raise HTTPException(500, "Could not make thumbnails")
+    return FileResponse(f, media_type="image/jpeg", headers={"Cache-Control": "max-age=3600"})
+
+
+# ------------------------------------------------------------------ sequences (the timeline)
+
+def seq_or_404(sid: str) -> dict:
+    try:
+        return sequences.get(sid)
+    except KeyError:
+        raise HTTPException(404, "Sequence not found")
+
+
+def item_summary(pid: str) -> dict | None:
+    try:
+        p = store.get(pid)
+    except KeyError:
+        return None
+    m, s = p["media"], p["status"]
+    return {"id": pid, "name": p["name"], "kind": m["kind"], "duration": m["duration"],
+            "has_video": m["has_video"], "has_audio": m["has_audio"], "state": s["state"],
+            "progress": s["progress"], "step": s["step"], "message": s["message"], "proxy": p["proxy"], "proxy_progress": p.get("proxy_progress", 0.0),
+            "language": p["language"], "words": len(p["words"]), "version": p["version"], "width": m["width"], "height": m["height"],
+            "sprite_count": media.sprite_count(m["duration"]), "path": m["path"]}
+
+
+def seq_payload(s: dict) -> dict:
+    L = sequences.layout(s)
+    return {"id": s["id"], "name": s["name"], "version": sequences.combined_version(s),
+            "items": [i for i in (item_summary(pid) for pid in s["items"]) if i],
+            "clips": L["clips"], "duration": L["duration"],
+            "settings": exporters.seq_settings(sequences.projects_in_order(s)), "export": s["export"]}
+
+
+@app.get("/api/sequences")
+def list_sequences():
+    return sequences.list_all()
+
+
+class NewSeq(BaseModel):
+    name: str = ""
+
+
+@app.post("/api/sequences")
+def new_sequence(body: NewSeq):
+    name = body.name.strip() or f"Sequence {len(sequences.list_all()) + 1}"
+    return seq_payload(sequences.create(name))
+
+
+@app.post("/api/sequences/for-project/{pid}")
+def sequence_for_project(pid: str):
+    """The sequence that contains this media (made on demand), so old project links keep working."""
+    p = proj(pid)
+    s = sequences.find_for_project(pid)
+    if not s:
+        s = sequences.create(p["name"])
+        sequences.add_clip(s, pid)
+        sequences.save(s)
+    return seq_payload(s)
+
+
+@app.get("/api/sequences/{sid}")
+def get_sequence(sid: str):
+    return seq_payload(seq_or_404(sid))
+
+
+@app.get("/api/sequences/{sid}/version")
+def sequence_version(sid: str):
+    return {"version": sequences.combined_version(seq_or_404(sid))}
+
+
+@app.patch("/api/sequences/{sid}")
+def rename_sequence(sid: str, body: NewSeq):
+    s = seq_or_404(sid)
+    if body.name.strip():
+        s["name"] = body.name.strip()
+        sequences.save(s)
+    return {"ok": True}
+
+
+@app.delete("/api/sequences/{sid}")
+def delete_sequence(sid: str):
+    seq_or_404(sid)
+    sequences.delete(sid)
+    return {"ok": True}
+
+
+@app.post("/api/sequences/{sid}/import")
+async def import_files(sid: str, files: list[UploadFile] = File(...), language: str = Form("auto"),
+                       model: str = Form(""), add_to_timeline: bool = Form(True)):
+    s = seq_or_404(sid)
+    for f in files:
+        p = await _ingest_upload(f, language, model or None)
+        with sequences._lock:
+            if add_to_timeline:
+                sequences.add_clip(s, p["id"])
+            else:
+                sequences.add_item(s, p["id"])
+            sequences.save(s)
+    return seq_payload(s)
+
+
+@app.put("/api/sequences/{sid}/upload")
+async def upload_raw(sid: str, request: Request, filename: str, language: str = "auto", model: str = "",
+                     add_to_timeline: bool = True):
+    """Upload one file as the raw request body: written straight to disk once (no multipart spooling)."""
+    s = seq_or_404(sid)
+    tmp_dir = DATA_DIR / "uploads" / store.new_id()
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    dest = tmp_dir / Path(filename).name
+    with dest.open("wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+    p = _register_upload(dest, tmp_dir, filename, language, model or None)
+    with sequences._lock:
+        if add_to_timeline:
+            sequences.add_clip(s, p["id"])
+        else:
+            sequences.add_item(s, p["id"])
+        sequences.save(s)
+    return seq_payload(s)
+
+
+class ImportPaths(BaseModel):
+    paths: list[str]
+    language: str = "auto"
+    model: str | None = None
+    add_to_timeline: bool = True
+
+
+@app.post("/api/sequences/{sid}/import-path")
+def import_paths(sid: str, body: ImportPaths):
+    s = seq_or_404(sid)
+    for raw in body.paths:
+        path = Path(raw.strip().strip('"'))
+        if not path.is_file():
+            raise HTTPException(400, f"File not found: {path}")
+        existing = next((x for x in (store.get(i["id"]) for i in store.list_all())
+                         if x["media"]["path"] == str(path.resolve()) and x["words"] and not x["owns_media"]), None)
+        if existing:  # already transcribed: copy the transcript (but not the old cuts) instead of redoing it
+            p = store.duplicate(existing["id"])
+        else:
+            try:
+                info = media.probe(path)
+            except ValueError as e:
+                raise HTTPException(400, f"{path.name}: {e}")
+            p = store.create(path.stem, info, False)
+            transcribe.submit(p["id"], body.language, body.model)
+        with sequences._lock:
+            if body.add_to_timeline:
+                sequences.add_clip(s, p["id"])
+            else:
+                sequences.add_item(s, p["id"])
+            sequences.save(s)
+    return seq_payload(s)
+
+
+class ItemReq(BaseModel):
+    project_id: str
+
+
+@app.post("/api/sequences/{sid}/items")
+def add_item(sid: str, body: ItemReq):
+    s = seq_or_404(sid)
+    proj(body.project_id)
+    sequences.add_item(s, body.project_id)
+    sequences.save(s)
+    return seq_payload(s)
+
+
+@app.delete("/api/sequences/{sid}/items/{pid}")
+def remove_item(sid: str, pid: str):
+    s = seq_or_404(sid)
+    s["items"] = [x for x in s["items"] if x != pid]
+    s["clips"] = [c for c in s["clips"] if c["pid"] != pid]
+    sequences.save(s)
+    return seq_payload(s)
+
+
+class ClipReq(BaseModel):
+    project_id: str
+    index: int | None = None
+
+
+@app.post("/api/sequences/{sid}/clips")
+def add_clip(sid: str, body: ClipReq):
+    s = seq_or_404(sid)
+    proj(body.project_id)
+    with sequences._lock:
+        clip = sequences.add_clip(s, body.project_id, body.index)
+        sequences.save(s)
+    return {"clip": clip, "sequence": seq_payload(s)}
+
+
+class MoveReq(BaseModel):
+    index: int
+
+
+@app.post("/api/sequences/{sid}/clips/{cid}/move")
+def move_clip(sid: str, cid: str, body: MoveReq):
+    s = seq_or_404(sid)
+    with sequences._lock:
+        clip = next((c for c in s["clips"] if c["id"] == cid), None)
+        if not clip:
+            raise HTTPException(404, "Clip not found")
+        s["clips"].remove(clip)
+        s["clips"].insert(max(0, min(body.index, len(s["clips"]))), clip)
+        sequences.save(s)
+    return seq_payload(s)
+
+
+@app.delete("/api/sequences/{sid}/clips/{cid}")
+def remove_clip(sid: str, cid: str):
+    s = seq_or_404(sid)
+    with sequences._lock:
+        before = len(s["clips"])
+        s["clips"] = [c for c in s["clips"] if c["id"] != cid]
+        if len(s["clips"]) == before:
+            raise HTTPException(404, "Clip not found")
+        sequences.save(s)
+    return seq_payload(s)
+
+
+def _seq_render_job(sid: str, fmt: str | None, out_dir: str | None) -> None:
+    s = sequences.get(sid)
+    try:
+        out = exporters.render_sequence(s, sequences.projects_in_order(s), fmt, out_dir)
+        s["export"] = {"state": "done", "progress": 1.0, "file": str(out), "message": ""}
+    except Exception as e:
+        s["export"] = {"state": "error", "progress": 0.0, "file": None, "message": str(e)[:500]}
+    sequences.save(s)
+
+
+@app.post("/api/sequences/{sid}/export")
+def export_sequence(sid: str, body: ExportReq):
+    s = seq_or_404(sid)
+    ps = sequences.projects_in_order(s)
+    if not ps:
+        raise HTTPException(409, "The timeline is empty")
+    if body.kind in TEXT_EXPORTS:
+        try:
+            path = exporters.write_text_export(s, body.kind, body.out_dir, projects=ps, sub="sequences")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"state": "done", "file": str(path)}
+    if body.kind == "media":
+        if s["export"]["state"] == "running":
+            raise HTTPException(409, "An export is already running")
+        s["export"] = {"state": "running", "progress": 0.0, "file": None, "message": ""}
+        sequences.save(s)
+        threading.Thread(target=_seq_render_job, args=(sid, body.format, body.out_dir), daemon=True).start()
+        return {"state": "running"}
+    raise HTTPException(400, "kind must be xml, edl, srt, vtt, txt or media")
+
+
+@app.get("/api/sequences/{sid}/export-status")
+def sequence_export_status(sid: str):
+    return seq_or_404(sid)["export"]
+
+
+@app.get("/api/sequences/{sid}/download/{kind}")
+def download_sequence(sid: str, kind: str):
+    s = seq_or_404(sid)
+    if kind == "media":
+        f = s["export"].get("file")
+        if not f or not Path(f).exists():
+            raise HTTPException(404, "Render the media first")
+        return FileResponse(f, filename=Path(f).name)
+    try:
+        path = exporters.write_text_export(s, kind, None, projects=sequences.projects_in_order(s), sub="sequences")
     except ValueError as e:
         raise HTTPException(400, str(e))
     return FileResponse(path, filename=path.name)
