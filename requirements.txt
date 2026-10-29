@@ -1,0 +1,9 @@
+faster-whisper
+fastapi
+uvicorn[standard]
+python-multipart
+httpx
+mcp<2
+# GPU (NVIDIA) support for faster-whisper on Windows; harmless to skip if you only use the CPU
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoCut</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/">✂️ AutoCut</a>
+  <span id="crumb" class="crumb"></span>
+  <span class="spacer"></span>
+  <label class="chk small" title="When on, cuts made by Claude through MCP are applied immediately instead of waiting for your approval">
+    <input type="checkbox" id="claudeAuto"> Claude cuts apply instantly
+  </label>
+</header>
+<main id="app"></main>
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>
