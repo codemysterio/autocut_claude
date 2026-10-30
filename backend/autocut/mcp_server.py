@@ -349,15 +349,37 @@ def export_status(project_id: str, wait: int = 0) -> str:
 
 # ------------------------------------------------------------------ sequences (timeline)
 
+def _layer_text(l: dict, indent: str) -> str:
+    sy = l["sync"]
+    if l["mode"] == "free":
+        where = f"starts at {_t(l['start'])}"
+    else:
+        where = f"{sy['state']} {int((sy['confidence'] or 0) * 100)}%, offset {l['offset']:+.3f}s"
+        if abs(sy.get("drift_ppm") or 0) > 0.5:
+            where += f", drift {sy['drift_ppm']:.1f}ppm corrected"
+    flags = ("muted " if l["mute"] else "") + ("replaces main audio " if l["replace_main_audio"] else "")
+    if l["media"].get("has_video"):
+        flags += (f"picture {'on' if l['v_on'] else 'off'} on V{l['v_row'] + 1} at {l['v_x'] * 100:.0f}%,{l['v_y'] * 100:.0f}% "
+                  f"size {l['v_scale'] * 100:.0f}% opacity {l['v_opacity'] * 100:.0f}% ")
+    return (f"{indent}layer_id={l['id']} \"{l['name']}\" {where}; gain {l['gain_db']:+.1f}dB, fades {l['fade_in']}/{l['fade_out']}s "
+            f"{flags}" + (f"- {sy['message']}" if sy.get("message") else "")).rstrip()
+
+
 def _seq_text(s: dict) -> str:
     st = s["settings"]
     head = (f"sequence_id={s['id']} \"{s['name']}\" {_t(s['duration'])}, "
             + (f"{st['width']}x{st['height']} {st['fps_num'] / st['fps_den']:.2f} fps" if st["has_video"] else "audio only"))
-    clips = [f"  {i}. clip_id={c['id']} {c['name']} ({c['kind']}) at {_t(c['start'])}, length {_t(c['length'])}"
-             for i, c in enumerate(s["clips"])]
+    clips = []
+    for i, c in enumerate(s["clips"]):
+        clips.append(f"  {i}. clip_id={c['id']} {c['name']} ({c['kind']}) at {_t(c['start'])}, length {_t(c['length'])}")
+        clips += [_layer_text(l, "       ") for l in c["layers"]]
+    if s.get("free_layers"):
+        clips.append("  Music / free layers:")
+        clips += [_layer_text(l, "       ") for l in s["free_layers"]]
     bin_only = [i["name"] + f" (project_id={i['id']}, {i['state']})" for i in s["items"]
                 if not any(c["pid"] == i["id"] for c in s["clips"])]
-    return "\n".join([head, *clips] + ([f"In bin, not on timeline: {', '.join(bin_only)}"] if bin_only else [])
+    marks = [f"  marker {m['name'] or '-'} at {_t(m['t'])} ({m['color']})" for m in s.get("markers", [])]
+    return "\n".join([head, *clips, *marks] + ([f"In bin, not on timeline: {', '.join(bin_only)}"] if bin_only else [])
                      + [f"Browser UI: {BASE}/#/s/{s['id']}"])
 
 
@@ -405,9 +427,145 @@ def move_clip(sequence_id: str, clip_id: str, position: int) -> str:
 
 
 @mcp.tool()
-def remove_clip(sequence_id: str, clip_id: str) -> str:
-    """Remove a clip from the timeline (the media and its transcript are kept)."""
-    return _seq_text(_call("DELETE", f"/sequences/{sequence_id}/clips/{clip_id}"))
+def remove_clip(sequence_id: str, clip_id: str, ripple: bool = False) -> str:
+    """Remove a clip from the timeline (the media and its transcript are kept).
+
+    ripple=False leaves a gap where it was; ripple=True slides the clips after it left to close the gap."""
+    return _seq_text(_call("DELETE", f"/sequences/{sequence_id}/clips/{clip_id}" + ("?ripple=true" if ripple else "")))
+
+
+@mcp.tool()
+def place_clip(sequence_id: str, clip_id: str, start_seconds: float) -> str:
+    """Move a clip to a start time on the timeline. Gaps are allowed; if the spot is taken it slides to the nearest free one."""
+    return _seq_text(_call("POST", f"/sequences/{sequence_id}/clips/{clip_id}/move", json={"start": start_seconds}))
+
+
+@mcp.tool()
+def split_clip(sequence_id: str, clip_id: str, at_seconds: float) -> str:
+    """Razor: cut a clip in two at a timeline time inside it. Its layers are copied to the second half."""
+    return _seq_text(_call("POST", f"/sequences/{sequence_id}/clips/{clip_id}/split", json={"time": at_seconds})["sequence"])
+
+
+@mcp.tool()
+def trim_clip(sequence_id: str, clip_id: str, edge: str, at_seconds: float) -> str:
+    """Trim a clip: edge 'in' moves its start to the timeline time, 'out' moves its end. The other edge stays put."""
+    return _seq_text(_call("POST", f"/sequences/{sequence_id}/clips/{clip_id}/trim", json={"edge": edge, "time": at_seconds}))
+
+
+@mcp.tool()
+def close_gaps(sequence_id: str) -> str:
+    """Slide all clips together from time 0, closing every gap."""
+    return _seq_text(_call("POST", f"/sequences/{sequence_id}/close-gaps"))
+
+
+@mcp.tool()
+def add_marker(sequence_id: str, at_seconds: float, name: str = "", color: str = "red") -> str:
+    """Drop a marker on the timeline (colors: red, blue, green, yellow, purple). Markers are included in the Premiere XML."""
+    return _seq_text(_call("POST", f"/sequences/{sequence_id}/markers", json={"time": at_seconds, "name": name, "color": color}))
+
+
+@mcp.tool()
+def set_track(sequence_id: str, track: str, mute: bool | None = None, solo: bool | None = None, lock: bool | None = None) -> str:
+    """Mute / solo / lock a track by label: V1 (mute = hide the picture), A1 (the clips' own sound), A2, A3… (layers)."""
+    body = {k: v for k, v in {"mute": mute, "solo": solo, "lock": lock}.items() if v is not None}
+    return _seq_text(_call("PATCH", f"/sequences/{sequence_id}/tracks/{track}", json=body))
+
+
+@mcp.tool()
+def undo_timeline(sequence_id: str) -> str:
+    """Undo the last timeline edit (move, trim, split, delete, marker, track switch, layer change)."""
+    r = _call("POST", f"/sequences/{sequence_id}/undo")
+    return ("undone.\n" if r["ok"] else "nothing to undo.\n") + _seq_text(r["sequence"])
+
+
+@mcp.tool()
+def unlink_layer(sequence_id: str, layer_id: str) -> str:
+    """Turn a synced layer into a free layer that stays where it is but no longer follows its clip's cuts."""
+    return _seq_text(_call("POST", f"/sequences/{sequence_id}/layers/{layer_id}/unlink"))
+
+
+@mcp.tool()
+def add_layer(sequence_id: str, clip_id: str, paths: list[str]) -> str:
+    """Attach extra recordings (external mic, second camera, screen recording) to a clip and auto-sync them.
+
+    AutoCut matches each file's audio to the clip's audio and reports a confidence score, the time offset
+    and any clock drift (which it corrects). Check sequence_status after a few seconds; if the state is
+    'low' or 'failed', use nudge_layer. The layer follows every cut made on the clip.
+    """
+    return _seq_text(_call("POST", f"/sequences/{sequence_id}/clips/{clip_id}/layers", json={"paths": paths}))
+
+
+@mcp.tool()
+def add_music_layer(sequence_id: str, paths: list[str], start_seconds: float = 0.0) -> str:
+    """Add music or other sound to the whole sequence, placed by time (not synced to the video)."""
+    s = _call("POST", f"/sequences/{sequence_id}/layers", json={"paths": paths})
+    for l in s["free_layers"][-len(paths):]:
+        if start_seconds:
+            s = _call("PATCH", f"/sequences/{sequence_id}/layers/{l['id']}", json={"start": start_seconds})
+    return _seq_text(s)
+
+
+@mcp.tool()
+def set_layer(sequence_id: str, layer_id: str, gain_db: float | None = None, mute: bool | None = None,
+              fade_in_seconds: float | None = None, fade_out_seconds: float | None = None,
+              trim_in_seconds: float | None = None, trim_out_seconds: float | None = None,
+              replace_main_audio: bool | None = None, start_seconds: float | None = None,
+              show_picture: bool | None = None, picture_corner: str = "", picture_size_percent: float | None = None,
+              picture_x_percent: float | None = None, picture_y_percent: float | None = None,
+              picture_opacity_percent: float | None = None) -> str:
+    """Change a layer: volume in dB, mute, fades, trim (in the layer's own file time), replace the camera audio,
+    or (music layers) the start position on the sequence. Only the values you pass are changed.
+
+    For a layer that has a picture (second camera, screen recording, b-roll): show_picture, picture_corner
+    ('top-left', 'top-right', 'bottom-left', 'bottom-right' or 'full'), picture_size_percent (width as a % of the frame),
+    picture_x_percent / picture_y_percent (top-left corner as a % of the frame) and picture_opacity_percent.
+    Fades also fade the picture."""
+    body = {k: v for k, v in {"gain_db": gain_db, "mute": mute, "fade_in": fade_in_seconds, "fade_out": fade_out_seconds,
+                              "trim_in": trim_in_seconds, "trim_out": trim_out_seconds,
+                              "replace_main_audio": replace_main_audio, "start": start_seconds, "v_on": show_picture,
+                              "v_scale": None if picture_size_percent is None else picture_size_percent / 100,
+                              "v_x": None if picture_x_percent is None else picture_x_percent / 100,
+                              "v_y": None if picture_y_percent is None else picture_y_percent / 100,
+                              "v_opacity": None if picture_opacity_percent is None else picture_opacity_percent / 100}.items()
+            if v is not None}
+    if picture_corner:
+        seq = _call("GET", f"/sequences/{sequence_id}")
+        layer = next((l for c in seq["clips"] for l in c["layers"] if l["id"] == layer_id), None) or             next((l for l in seq["free_layers"] if l["id"] == layer_id), None)
+        if not layer or not layer["media"].get("has_video"):
+            return "That layer has no picture."
+        W, H = seq["settings"]["width"], seq["settings"]["height"]
+        lw, lh = layer["media"]["width"] or 16, layer["media"]["height"] or 9
+        full = picture_corner == "full"
+        sc = body.get("v_scale") or (min(1.0, (H / W) / (lh / lw)) if full else (layer["v_scale"] if layer["v_scale"] < 0.9 else 0.32))
+        hf, m = sc * (lh / lw) * (W / H), 0.03
+        pos = {"top-left": (m, m), "top-right": (1 - m - sc, m), "bottom-left": (m, 1 - m - hf),
+               "bottom-right": (1 - m - sc, 1 - m - hf), "full": ((1 - sc) / 2, (1 - hf) / 2)}.get(picture_corner)
+        if not pos:
+            return "picture_corner must be top-left, top-right, bottom-left, bottom-right or full."
+        body.update(v_x=pos[0], v_y=pos[1], v_scale=sc)
+    return _seq_text(_call("PATCH", f"/sequences/{sequence_id}/layers/{layer_id}", json=body))
+
+
+@mcp.tool()
+def nudge_layer(sequence_id: str, layer_id: str, frames: float = 0.0, seconds: float = 0.0) -> str:
+    """Move a synced layer later (positive) or earlier (negative) relative to the video, by frames and/or seconds."""
+    s = _call("GET", f"/sequences/{sequence_id}")
+    fps = s["settings"]["fps_num"] / s["settings"]["fps_den"] if s["settings"]["has_video"] else 30.0
+    return _seq_text(_call("PATCH", f"/sequences/{sequence_id}/layers/{layer_id}",
+                           json={"offset_delta": seconds + frames / fps}))
+
+
+@mcp.tool()
+def sync_layer(sequence_id: str, layer_id: str) -> str:
+    """Run the automatic audio sync again for a layer (after trimming the clip, or to retry a failed sync)."""
+    _call("POST", f"/sequences/{sequence_id}/layers/{layer_id}/sync")
+    return "Matching audio… call sequence_status in a few seconds for the result."
+
+
+@mcp.tool()
+def remove_layer(sequence_id: str, layer_id: str) -> str:
+    """Remove a layer from the timeline (the file itself is not touched)."""
+    return _seq_text(_call("DELETE", f"/sequences/{sequence_id}/layers/{layer_id}"))
 
 
 @mcp.tool()

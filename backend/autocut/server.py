@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -11,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import cleanup, editing, exporters, media, sequences, store, transcribe
+from . import cleanup, editing, exporters, media, sequences, store, syncing, transcribe
 from .config import DATA_DIR, DEFAULT_MODEL, FRONTEND_DIR, PORT
 
 app = FastAPI(title="AutoCut")
@@ -541,7 +542,8 @@ def seq_payload(s: dict) -> dict:
     L = sequences.layout(s)
     return {"id": s["id"], "name": s["name"], "version": sequences.combined_version(s),
             "items": [i for i in (item_summary(pid) for pid in s["items"]) if i],
-            "clips": L["clips"], "duration": L["duration"],
+            "clips": L["clips"], "duration": L["duration"], "free_layers": L["free_layers"],
+            "markers": L["markers"], "tracks": L["tracks"],
             "settings": exporters.seq_settings(sequences.projects_in_order(s)), "export": s["export"]}
 
 
@@ -684,6 +686,7 @@ def add_item(sid: str, body: ItemReq):
 @app.delete("/api/sequences/{sid}/items/{pid}")
 def remove_item(sid: str, pid: str):
     s = seq_or_404(sid)
+    sequences.snapshot(s)
     s["items"] = [x for x in s["items"] if x != pid]
     s["clips"] = [c for c in s["clips"] if c["pid"] != pid]
     sequences.save(s)
@@ -693,43 +696,184 @@ def remove_item(sid: str, pid: str):
 class ClipReq(BaseModel):
     project_id: str
     index: int | None = None
+    start: float | None = None
 
 
 @app.post("/api/sequences/{sid}/clips")
 def add_clip(sid: str, body: ClipReq):
+    """Put media on the timeline at `start` seconds, at list position `index`, or after the last clip."""
     s = seq_or_404(sid)
     proj(body.project_id)
     with sequences._lock:
-        clip = sequences.add_clip(s, body.project_id, body.index)
+        sequences.snapshot(s)
+        clip = sequences.add_clip(s, body.project_id, body.index, body.start)
         sequences.save(s)
     return {"clip": clip, "sequence": seq_payload(s)}
 
 
+def _clip_or_404(s: dict, cid: str) -> dict:
+    try:
+        c = sequences.clip_by_id(s, cid)
+    except KeyError:
+        raise HTTPException(404, "Clip not found")
+    if sequences.is_locked(s, "V1"):
+        raise HTTPException(409, "Track V1 is locked")
+    return c
+
+
 class MoveReq(BaseModel):
-    index: int
+    start: float | None = None
+    index: int | None = None
 
 
 @app.post("/api/sequences/{sid}/clips/{cid}/move")
 def move_clip(sid: str, cid: str, body: MoveReq):
+    """Move a clip to `start` seconds (it slides to the nearest free spot) or to list position `index`."""
     s = seq_or_404(sid)
     with sequences._lock:
-        clip = next((c for c in s["clips"] if c["id"] == cid), None)
-        if not clip:
-            raise HTTPException(404, "Clip not found")
-        s["clips"].remove(clip)
-        s["clips"].insert(max(0, min(body.index, len(s["clips"]))), clip)
+        _clip_or_404(s, cid)
+        sequences.snapshot(s)
+        sequences.move_clip(s, cid, body.start, body.index)
         sequences.save(s)
     return seq_payload(s)
 
 
-@app.delete("/api/sequences/{sid}/clips/{cid}")
-def remove_clip(sid: str, cid: str):
+class TrimReq(BaseModel):
+    edge: str      # "in" (left edge) or "out" (right edge)
+    time: float    # sequence time the edge was dragged to
+
+
+@app.post("/api/sequences/{sid}/clips/{cid}/trim")
+def trim_clip(sid: str, cid: str, body: TrimReq):
     s = seq_or_404(sid)
     with sequences._lock:
-        before = len(s["clips"])
-        s["clips"] = [c for c in s["clips"] if c["id"] != cid]
-        if len(s["clips"]) == before:
-            raise HTTPException(404, "Clip not found")
+        _clip_or_404(s, cid)
+        sequences.snapshot(s)
+        try:
+            sequences.trim_clip(s, cid, body.edge, body.time)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        sequences.save(s)
+    return seq_payload(s)
+
+
+class SplitReq(BaseModel):
+    time: float
+
+
+@app.post("/api/sequences/{sid}/clips/{cid}/split")
+def split_clip(sid: str, cid: str, body: SplitReq):
+    """Razor: cut the clip in two at `time` (sequence seconds)."""
+    s = seq_or_404(sid)
+    with sequences._lock:
+        _clip_or_404(s, cid)
+        sequences.snapshot(s)
+        try:
+            second = sequences.split_clip(s, cid, body.time)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        sequences.save(s)
+    return {"clip": second, "sequence": seq_payload(s)}
+
+
+@app.delete("/api/sequences/{sid}/clips/{cid}")
+def remove_clip(sid: str, cid: str, ripple: bool = False):
+    """Remove a clip. With ripple=true the clips after it slide left to close the gap."""
+    s = seq_or_404(sid)
+    with sequences._lock:
+        _clip_or_404(s, cid)
+        sequences.snapshot(s)
+        sequences.delete_clip(s, cid, ripple)
+        sequences.save(s)
+    return seq_payload(s)
+
+
+@app.post("/api/sequences/{sid}/close-gaps")
+def close_gaps(sid: str):
+    s = seq_or_404(sid)
+    with sequences._lock:
+        sequences.snapshot(s)
+        sequences.close_gaps(s, 0)
+        sequences.save(s)
+    return seq_payload(s)
+
+
+@app.post("/api/sequences/{sid}/undo")
+def undo_sequence(sid: str):
+    s = seq_or_404(sid)
+    with sequences._lock:
+        ok = sequences.undo(s)
+    return {"ok": ok, "sequence": seq_payload(s)}
+
+
+@app.post("/api/sequences/{sid}/redo")
+def redo_sequence(sid: str):
+    s = seq_or_404(sid)
+    with sequences._lock:
+        ok = sequences.redo(s)
+    return {"ok": ok, "sequence": seq_payload(s)}
+
+
+# ---- markers and track switches
+
+class MarkerReq(BaseModel):
+    time: float | None = None
+    name: str | None = None
+    color: str | None = None
+
+
+@app.post("/api/sequences/{sid}/markers")
+def add_marker(sid: str, body: MarkerReq):
+    s = seq_or_404(sid)
+    with sequences._lock:
+        sequences.snapshot(s)
+        sequences.add_marker(s, body.time or 0.0, body.name or "", body.color or "red")
+        sequences.save(s)
+    return seq_payload(s)
+
+
+@app.patch("/api/sequences/{sid}/markers/{mid}")
+def patch_marker(sid: str, mid: str, body: MarkerReq):
+    s = seq_or_404(sid)
+    m = next((m for m in s["markers"] if m["id"] == mid), None)
+    if not m:
+        raise HTTPException(404, "Marker not found")
+    with sequences._lock:
+        sequences.snapshot(s)
+        if body.time is not None:
+            m["t"] = max(0.0, body.time)
+        if body.name is not None:
+            m["name"] = body.name
+        if body.color is not None:
+            m["color"] = body.color
+        s["markers"].sort(key=lambda x: x["t"])
+        sequences.save(s)
+    return seq_payload(s)
+
+
+@app.delete("/api/sequences/{sid}/markers/{mid}")
+def remove_marker(sid: str, mid: str):
+    s = seq_or_404(sid)
+    with sequences._lock:
+        sequences.snapshot(s)
+        s["markers"] = [m for m in s["markers"] if m["id"] != mid]
+        sequences.save(s)
+    return seq_payload(s)
+
+
+class TrackReq(BaseModel):
+    lock: bool | None = None
+    mute: bool | None = None
+    solo: bool | None = None
+
+
+@app.patch("/api/sequences/{sid}/tracks/{label}")
+def patch_track(sid: str, label: str, body: TrackReq):
+    """Lock / mute / solo a track by its label (V1, A1, A2…)."""
+    s = seq_or_404(sid)
+    with sequences._lock:
+        sequences.snapshot(s)
+        s["tracks"].setdefault(label, {}).update(body.model_dump(exclude_unset=True))
         sequences.save(s)
     return seq_payload(s)
 
@@ -784,6 +928,194 @@ def download_sequence(sid: str, kind: str):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return FileResponse(path, filename=path.name)
+
+
+# ------------------------------------------------------------------ layers (extra mics, cameras, music)
+
+_sync_pool = ThreadPoolExecutor(max_workers=2)
+
+
+def _create_layer_project(path_str: str) -> dict:
+    path = Path(path_str.strip().strip('"'))
+    if not path.is_file():
+        raise HTTPException(400, f"File not found: {path}")
+    try:
+        info = media.probe(path)
+    except ValueError as e:
+        raise HTTPException(400, f"{path.name}: {e}")
+    p = store.create(path.stem, info, False)
+    p["is_layer"] = True
+    p["status"] = {"state": "ready", "step": "", "progress": 1.0, "message": ""}
+    store.save(p)
+    transcribe.ensure_proxy(p["id"])  # browser-playable copy for the preview
+    return p
+
+
+def _run_sync(sid: str, lid: str) -> None:
+    s = sequences.get(sid)
+    layer, clip = sequences.find_layer(s, lid)
+    if not layer or not clip:
+        return
+    with sequences._lock:
+        layer["sync"].update(state="syncing", message="Matching audio…")
+        sequences.save(s)
+    try:
+        main, lp = store.get(clip["pid"]), store.get(layer["pid"])
+        if not main["media"]["has_audio"] or not lp["media"]["has_audio"]:
+            raise RuntimeError("Both files need an audio track to sync automatically.")
+        r = syncing.estimate(main["media"]["path"], lp["media"]["path"], main["media"]["duration"],
+                             lp["media"]["duration"])
+    except Exception as e:
+        r = {"state": "failed", "confidence": 0.0, "windows": [], "drift_ppm": 0.0, "message": str(e)[:300]}
+    with sequences._lock:
+        layer["sync"] = {k: r.get(k) for k in ("state", "confidence", "windows", "drift_ppm", "message")}
+        if r["state"] in ("ok", "low"):
+            layer["offset"], layer["rate"] = r["offset"], r["rate"]
+        sequences.save(s)
+
+
+class LayerAdd(BaseModel):
+    paths: list[str]
+
+
+@app.post("/api/sequences/{sid}/clips/{cid}/layers")
+def add_synced_layers(sid: str, cid: str, body: LayerAdd):
+    """Attach extra recordings to a clip and sync them to it automatically."""
+    s = seq_or_404(sid)
+    clip = next((c for c in s["clips"] if c["id"] == cid), None)
+    if not clip:
+        raise HTTPException(404, "Clip not found")
+    for path in body.paths:
+        p = _create_layer_project(path)
+        layer = sequences.new_layer(p["id"], p["name"], "sync")
+        with sequences._lock:
+            sequences.snapshot(s)
+            sequences.add_sync_layer(s, clip, layer)
+            sequences.save(s)
+        _sync_pool.submit(_run_sync, sid, layer["id"])
+    return seq_payload(s)
+
+
+@app.post("/api/sequences/{sid}/layers")
+def add_free_layers(sid: str, body: LayerAdd):
+    """Add music or other layers placed by time on the whole sequence (no auto-sync)."""
+    s = seq_or_404(sid)
+    for path in body.paths:
+        p = _create_layer_project(path)
+        with sequences._lock:
+            sequences.snapshot(s)
+            sequences.add_free_layer(s, sequences.new_layer(p["id"], p["name"], "free"))
+            sequences.save(s)
+    return seq_payload(s)
+
+
+@app.put("/api/sequences/{sid}/layer-upload")
+async def upload_layer(sid: str, request: Request, filename: str, clip_id: str = "", mode: str = "sync"):
+    """Upload one extra file (dropped on the Layers tab) as a synced layer of `clip_id`, or as a free layer."""
+    s = seq_or_404(sid)
+    clip = next((c for c in s["clips"] if c["id"] == clip_id), None)
+    if mode == "sync" and not clip:
+        raise HTTPException(400, "Select a clip to sync the layer to")
+    dest = DATA_DIR / "layer_uploads" / store.new_id() / Path(filename).name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+    p = _create_layer_project(str(dest))
+    layer = sequences.new_layer(p["id"], p["name"], "sync" if mode == "sync" else "free")
+    with sequences._lock:
+        sequences.snapshot(s)
+        sequences.add_sync_layer(s, clip, layer) if mode == "sync" else sequences.add_free_layer(s, layer)
+        sequences.save(s)
+    if mode == "sync":
+        _sync_pool.submit(_run_sync, sid, layer["id"])
+    return seq_payload(s)
+
+
+class LayerPatch(BaseModel):
+    name: str | None = None
+    offset: float | None = None
+    offset_delta: float | None = None
+    rate: float | None = None
+    start: float | None = None
+    trim_in: float | None = None
+    trim_out: float | None = None
+    gain_db: float | None = None
+    mute: bool | None = None
+    fade_in: float | None = None
+    fade_out: float | None = None
+    replace_main_audio: bool | None = None
+    row: int | None = None
+    v_on: bool | None = None
+    v_x: float | None = None
+    v_y: float | None = None
+    v_scale: float | None = None
+    v_opacity: float | None = None
+    v_row: int | None = None
+
+
+@app.patch("/api/sequences/{sid}/layers/{lid}")
+def patch_layer(sid: str, lid: str, body: LayerPatch):
+    s = seq_or_404(sid)
+    layer, _clip = sequences.find_layer(s, lid)
+    if not layer:
+        raise HTTPException(404, "Layer not found")
+    changes = body.model_dump(exclude_unset=True)
+    delta = changes.pop("offset_delta", None)
+    if sequences.is_locked(s, f"A{layer['row'] + 1}"):
+        raise HTTPException(409, "That track is locked")
+    with sequences._lock:
+        sequences.snapshot(s)
+        layer.update(changes)
+        layer["row"] = max(1, int(layer.get("row") or 1))
+        layer["v_row"] = max(1, int(layer.get("v_row") or 1))
+        layer["v_scale"] = min(1.0, max(0.02, layer.get("v_scale") or 0.32))
+        layer["v_opacity"] = min(1.0, max(0.0, layer.get("v_opacity") if layer.get("v_opacity") is not None else 1.0))
+        layer["v_x"] = min(2.0, max(-1.0, layer.get("v_x") or 0.0))
+        layer["v_y"] = min(2.0, max(-1.0, layer.get("v_y") or 0.0))
+        if delta is not None:
+            layer["offset"] = layer["offset"] - delta  # +delta moves the layer later on the timeline
+        layer["rate"] = min(1.05, max(0.95, layer["rate"] or 1.0))
+        layer["trim_in"] = max(0.0, layer["trim_in"] or 0.0)
+        layer["fade_in"], layer["fade_out"] = max(0.0, layer["fade_in"]), max(0.0, layer["fade_out"])
+        sequences.save(s)
+    return seq_payload(s)
+
+
+@app.post("/api/sequences/{sid}/layers/{lid}/sync")
+def resync_layer(sid: str, lid: str):
+    s = seq_or_404(sid)
+    layer, clip = sequences.find_layer(s, lid)
+    if not layer or not clip:
+        raise HTTPException(404, "Only layers attached to a clip can be auto-synced")
+    _sync_pool.submit(_run_sync, sid, lid)
+    return {"ok": True}
+
+
+@app.post("/api/sequences/{sid}/layers/{lid}/unlink")
+def unlink_layer(sid: str, lid: str):
+    """Make a synced layer free: it stays where it is but no longer follows the clip's cuts or its sync."""
+    s = seq_or_404(sid)
+    with sequences._lock:
+        sequences.snapshot(s)
+        try:
+            sequences.unlink_layer(s, lid)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        sequences.save(s)
+    return seq_payload(s)
+
+
+@app.delete("/api/sequences/{sid}/layers/{lid}")
+def remove_layer(sid: str, lid: str):
+    s = seq_or_404(sid)
+    with sequences._lock:
+        sequences.snapshot(s)
+        for c in s["clips"]:
+            c["layers"] = [l for l in c["layers"] if l["id"] != lid]
+        s["layers"] = [l for l in s["layers"] if l["id"] != lid]
+        sequences.save(s)
+    return seq_payload(s)
 
 
 # ------------------------------------------------------------------ frontend

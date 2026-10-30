@@ -106,6 +106,8 @@ def list_all() -> list[dict]:
                 p = get(d.name)
             except Exception:
                 continue
+            if p.get("is_layer"):  # extra audio/video layers are not standalone media
+                continue
             out.append({
                 "id": p["id"], "name": p["name"], "created": p["created"],
                 "kind": p["media"]["kind"], "duration": p["media"]["duration"],

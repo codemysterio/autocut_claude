@@ -22,8 +22,8 @@ const TP = (() => {
       </div>
       <div class="tp-sug" id="tpSug" hidden></div>
       <div class="tp-body" id="tpBody"><div class="tp-empty">Select a clip on the timeline to edit its transcript.</div></div>`;
-    $("#tpUndo", root).onclick = guard(() => step("undo"));
-    $("#tpRedo", root).onclick = guard(() => step("redo"));
+    $("#tpUndo", root).onclick = guard(() => hooks.undo());
+    $("#tpRedo", root).onclick = guard(() => hooks.redo());
     $("#tpAnalyze", root).onclick = guard(analyze);
     const body = $("#tpBody", root);
     body.addEventListener("mouseup", onSelect);
@@ -50,12 +50,6 @@ const TP = (() => {
     const it = items.find((i) => i.id === P.id);
     if (!it) { P = null; paint(); return; }
     if (it.version !== P.version) { P = await api("/projects/" + P.id); paint(); }
-  }
-
-  async function step(what) {
-    if (!P) return;
-    await api(`/projects/${P.id}/${what}`, "POST");
-    await hooks.onChange();
   }
 
   async function analyze() {
@@ -94,7 +88,7 @@ const TP = (() => {
     if (s.state === "error" && !P.words.length) {
       body.innerHTML = `<div class="tp-empty"><b>Transcription failed</b><p>${esc(s.message)}</p>
         <button class="primary" id="tpRetry">Try again</button></div>`;
-      $("#tpRetry", root).onclick = guard(async () => { await api(`/projects/${P.id}/transcribe`, "POST", { language: "auto" }); await hooks.onChange(); });
+      $("#tpRetry", root).onclick = guard(async () => { await api(`/projects/${P.id}/transcribe`, "POST", { language: "auto" }); await hooks.onChange({ history: false }); });
       paintSuggestions(); return;
     }
     const { st, gaps } = cutIndex();
@@ -207,15 +201,13 @@ const TP = (() => {
     if (!w) return;
     const i = +w.dataset.i;
     const nv = prompt("Fix this word:", P.words[i].w);
-    if (nv && nv.trim() && nv !== P.words[i].w) { await api(`/projects/${P.id}/words/${i}`, "PATCH", { w: nv }); await hooks.onChange(); }
+    if (nv && nv.trim() && nv !== P.words[i].w) { await api(`/projects/${P.id}/words/${i}`, "PATCH", { w: nv }); await hooks.onChange({ history: false }); }
   }
 
   async function onKey(e) {
     if (!P || /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
     const f = $("#floating");
     if ((e.key === "Delete" || e.key === "Backspace") && f) { e.preventDefault(); await cutRange(...f._range); }
-    else if (e.ctrlKey && e.key.toLowerCase() === "z") { e.preventDefault(); await step("undo"); }
-    else if (e.ctrlKey && (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"))) { e.preventDefault(); await step("redo"); }
   }
 
   // Highlight the word being played (srcTime = seconds in the media file).
